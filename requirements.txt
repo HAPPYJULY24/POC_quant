@@ -1,0 +1,8 @@
+pandas
+numpy
+yfinance
+apscheduler
+pytz
+sqlalchemy
+requests
+git+https://github.com/rongardF/tvdatafeed.git

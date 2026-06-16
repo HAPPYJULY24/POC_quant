@@ -1,0 +1,51 @@
+{
+  "system_settings": {
+    "environment": "POC_LOCAL",
+    "database_path": "sqlite:///bursa_poc.db",
+    "poll_interval_seconds": 900,
+    "log_level": "INFO"
+  },
+  
+  "account_settings": {
+    "initial_capital_rm": 100000.0,
+    "risk_per_trade_pct": 0.01,
+    "max_position_lots": 20
+  },
+  
+  "strategy_settings": {
+    "strategy_id": "POC_ZSCORE_FCPO",
+    "lookback_period": 40,
+    "upper_entry_threshold": 2.0,
+    "lower_entry_threshold": -2.5,
+    "exit_threshold": 0.5,
+    "assets": {
+      "FCPO": {
+        "multiplier": 25.0,
+        "tick_size": 1.0,
+        "tv_ticker": "MYX:FCPO1!",
+        "yf_ticker": "FCPO.KL"
+      },
+      "ZL": {
+        "name": "CBOT Soybean Oil (美豆油)",
+        "multiplier": 1.0,
+        "tick_size": 0.01,
+        "tv_ticker": "CBOT:ZL1!",
+        "yf_ticker": "ZL=F"
+      },
+      "USDMYR": {
+        "tv_ticker": "FX_IDC:USDMYR",
+        "yf_ticker": "MYR=X"
+      }
+    }
+  },
+  
+  "trading_sessions": {
+    "timezone": "Asia/Kuala_Lumpur",
+    "ignore_weekends": true,
+    "fcpo_active_sessions": [
+      {"start": "10:30", "end": "12:30"},
+      {"start": "14:30", "end": "18:00"},
+      {"start": "21:00", "end": "23:00"}
+    ]
+  }
+}
