@@ -2,8 +2,8 @@
 title BMD Quant Platform Windows Control Panel
 color 0B
 
-set "LOCAL_PYTHON=C:\Users\yinwe\miniconda3\envs\poc_quant\python.exe"
-set "LOCAL_PIP=C:\Users\yinwe\miniconda3\envs\poc_quant\Scripts\pip.exe"
+set "LOCAL_PYTHON=D:\Miniconda3\envs\poc_quant\python.exe"
+set "LOCAL_PIP=D:\Miniconda3\envs\poc_quant\Scripts\pip.exe"
 
 if exist "%LOCAL_PYTHON%" (
     set "PYTHON_ENV_EXE=%LOCAL_PYTHON%"
@@ -124,4 +124,3 @@ echo Thank you for using BMD Quant Platform. Good trading!
 echo =====================================================================
 timeout /t 3 >nul
 exit
-

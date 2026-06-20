@@ -379,6 +379,11 @@ class IngestionPipeline:
             # 2. Trigger registered callbacks (e.g. to clear factor brain)
             for cb in self.rollover_callbacks:
                 try:
-                    cb()
+                    import inspect
+                    sig = inspect.signature(cb)
+                    if len(sig.parameters) > 0:
+                        cb(latest_bar)
+                    else:
+                        cb()
                 except Exception as e:
                     logger.error(f"Error in rollover callback: {e}")

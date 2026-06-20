@@ -222,3 +222,71 @@ class DynamicExpressionFactor(BaseFactor):
                 return 0
             return 99
 
+
+class CustomTrendZScoreFactor(BaseFactor):
+    """Concrete factor class implementing the custom Trend + Z-Score Short-only strategy from backtesting."""
+    def __init__(self, name: str, lookback_period: int = 40, symbol: str = "FCPO"):
+        super().__init__(name, lookback_period, symbol)
+        # Separate deques for spreads and close prices
+        self.spread_memory = collections.deque(maxlen=lookback_period)
+        self.close_memory = collections.deque(maxlen=60)
+        self.current_signal = 0 # state tracker: -1 for short, 0 for flat
+
+    def update_data(self, aligned_bar: AlignedPayload) -> None:
+        if aligned_bar.spread is not None and not np.isnan(aligned_bar.spread):
+            self.spread_memory.append(aligned_bar.spread)
+        if aligned_bar.fcpo_close is not None and not np.isnan(aligned_bar.fcpo_close):
+            self.close_memory.append(aligned_bar.fcpo_close)
+
+    def is_ready(self) -> bool:
+        # We need at least 40 spreads and 60 closes (for rolling 60 mean)
+        return len(self.spread_memory) >= self.lookback_period and len(self.close_memory) >= 60
+
+    def compute(self) -> float:
+        spreads = list(self.spread_memory)
+        mean = float(np.mean(spreads))
+        std = float(np.std(spreads))
+        if std == 0.0:
+            raise ZeroVarianceException("Standard deviation of the spread window is exactly 0.0.")
+        z_score = (spreads[-1] - mean) / std
+        return z_score
+
+    def generate_signal(self, raw_score: float) -> int:
+        # raw_score is the computed Z-Score factor
+        close_list = list(self.close_memory)
+        current_close = close_list[-1]
+        
+        # Calculate indicators
+        # 1. dynamic_low = close.rolling(20).min().shift(1) -> min of the 20 periods before current
+        dynamic_low = min(close_list[-21:-1])
+        
+        # 2. close.rolling(60).mean()
+        mean_60 = np.mean(close_list[-60:])
+        
+        # 3. close.rolling(30).mean()
+        mean_30 = np.mean(close_list[-30:])
+        
+        # entry_short condition:
+        # (close < dynamic_low) & (close < close.rolling(60).mean()) & (factor > 0.5)
+        entry_short = (current_close < dynamic_low) and (current_close < mean_60) and (raw_score > 0.5)
+        
+        # exit_short condition:
+        # (factor < 0.0) | (close > close.rolling(30).mean())
+        exit_short = (raw_score < 0.0) or (current_close > mean_30)
+        
+        # State machine transition to prevent repeated entry trigger (which RiskSentinel treats as ADD)
+        if self.current_signal == 0:
+            if entry_short:
+                self.current_signal = -1
+                return -1
+            else:
+                return 99 # Maintain flat/no position without triggering transactions
+        elif self.current_signal == -1:
+            if exit_short:
+                self.current_signal = 0
+                return 0
+            else:
+                return 99 # Maintain short/no change without triggering additional adds
+                
+        return 99
+

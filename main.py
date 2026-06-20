@@ -10,8 +10,8 @@ import pytz
 from src.config import ConfigManager
 from src.utils import setup_logger, get_kl_time, format_datetime
 from src.data_ingestion import IngestionPipeline, calculate_atr_latest
-from src.models import AlignedPayload
-from src.factors import DynamicExpressionFactor
+from src.models import AlignedPayload, SignalPayload
+from src.factors import DynamicExpressionFactor, CustomTrendZScoreFactor
 from src.risk_sentinel import RiskSentinel
 import src.database as db
 
@@ -94,24 +94,32 @@ def main():
     # 3. Instantiate Factor Brain with asymmetric thresholds from config
     strategy_cfg = config.strategy
     lookback = strategy_cfg.get("lookback_period", 40)
+    strategy_id = strategy_cfg.get("strategy_id", "POC_ZSCORE_FCPO")
     
-    # Load thresholds and expression (no magic numbers!)
-    upper = strategy_cfg.get("upper_entry_threshold", 2.0)
-    lower = strategy_cfg.get("lower_entry_threshold", -2.5)
-    exit_val = strategy_cfg.get("exit_threshold", 0.5)
-    expression = strategy_cfg.get("factor_expression", "(spreads[-1] - mean(spreads)) / std(spreads)")
-    mode = strategy_cfg.get("mode", "mean_reversion")
-    
-    factor_brain = DynamicExpressionFactor(
-        name="Dynamic_ZScore_FCPO_CBOTSoybeanOil",
-        lookback_period=lookback,
-        expression=expression,
-        upper_entry_threshold=upper,
-        lower_entry_threshold=lower,
-        exit_threshold=exit_val,
-        symbol="FCPO",
-        mode=mode
-    )
+    if strategy_id == "CUSTOM_TREND_ZSCORE":
+        factor_brain = CustomTrendZScoreFactor(
+            name="CustomTrendZScoreFactor_FCPO",
+            lookback_period=lookback,
+            symbol="FCPO"
+        )
+    else:
+        # Load thresholds and expression (no magic numbers!)
+        upper = strategy_cfg.get("upper_entry_threshold", 2.0)
+        lower = strategy_cfg.get("lower_entry_threshold", -2.5)
+        exit_val = strategy_cfg.get("exit_threshold", 0.5)
+        expression = strategy_cfg.get("factor_expression", "(spreads[-1] - mean(spreads)) / std(spreads)")
+        mode = strategy_cfg.get("mode", "mean_reversion")
+        
+        factor_brain = DynamicExpressionFactor(
+            name="Dynamic_ZScore_FCPO_CBOTSoybeanOil",
+            lookback_period=lookback,
+            expression=expression,
+            upper_entry_threshold=upper,
+            lower_entry_threshold=lower,
+            exit_threshold=exit_val,
+            symbol="FCPO",
+            mode=mode
+        )
     
     # 4. Instantiate Risk Sentinel wind-control layer
     risk_sentinel = RiskSentinel(config)
@@ -120,9 +128,28 @@ def main():
     pipeline.register_dispatcher(process_aligned_payload)
     
     # Register rollover brain reset callback
-    def on_rollover_detected() -> None:
-        logger.warning("🚨 [ROLLOVER RESET] Clearing factor brain memory deque due to contract rollover.")
-        factor_brain.memory.clear()
+    def on_rollover_detected(latest_bar) -> None:
+        logger.warning(f"🚨 [ROLLOVER RESET] Clearing factor brain memory deque due to contract rollover at {latest_bar.datetime}.")
+        if hasattr(factor_brain, "memory"):
+            factor_brain.memory.clear()
+        if hasattr(factor_brain, "spread_memory"):
+            factor_brain.spread_memory.clear()
+        if hasattr(factor_brain, "close_memory"):
+            factor_brain.close_memory.clear()
+            
+        # Put emergency signal to force liquidation
+        emergency_signal = SignalPayload(
+            timestamp=latest_bar.datetime,
+            factor_name="EMERGENCY_ROLLOVER_DETECTOR",
+            raw_score=0.0,
+            action_signal=0,  # Force close
+            current_price=latest_bar.close,
+            volatility_metric=1.0,
+            symbol="FCPO",
+            is_emergency_rollover=True
+        )
+        signal_queue.put(emergency_signal)
+        logger.warning("🚨 [ROLLOVER RESET] Dispatched emergency rollover signal to the queue.")
         
     pipeline.rollover_callbacks.append(on_rollover_detected)
     
@@ -138,10 +165,20 @@ def main():
     # 7. Pre-warm Factor Brain Memory sliding window using DB history
     logger.info("Pre-warming factor brain memory deques from SQLite aligned history...")
     try:
-        aligned_history = db.get_aligned_history(pipeline.db_uri, limit=lookback)
+        warmup_limit = max(lookback, 65)
+        aligned_history = db.get_aligned_history(pipeline.db_uri, limit=warmup_limit)
         for hist in aligned_history:
             factor_brain.update_data(hist)
-        logger.info(f"Factor brain memory warmed up with {len(factor_brain.memory)} historical records.")
+            
+        mem_len = len(factor_brain.memory) if hasattr(factor_brain, "memory") else len(factor_brain.spread_memory)
+        logger.info(f"Factor brain memory warmed up with {mem_len} historical records.")
+        
+        # Synchronize current_signal state with the actual portfolio state direction
+        initial_cap = config.account.get("initial_capital_rm", 100000.0)
+        state = db.load_portfolio_state(pipeline.db_uri, strategy_id, initial_cap)
+        if hasattr(factor_brain, "current_signal"):
+            factor_brain.current_signal = state.get("position_direction", 0)
+            logger.info(f"Synchronized factor brain state: current_signal={factor_brain.current_signal}")
     except Exception as e:
         logger.error(f"Failed to pre-warm factor brain memory: {e}. Warm up will run incrementally in real-time.")
         

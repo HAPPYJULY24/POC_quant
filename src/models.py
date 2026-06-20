@@ -60,3 +60,4 @@ class SignalPayload:
     current_price: float
     volatility_metric: float  # e.g., ATR value
     symbol: str = "FCPO"  # Primary traded asset, defaults to FCPO
+    is_emergency_rollover: bool = False

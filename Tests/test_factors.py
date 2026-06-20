@@ -196,5 +196,82 @@ class TestAlgorithmicBrain(unittest.TestCase):
         # no man's land -> Hold (99)
         self.assertEqual(factor.generate_signal(0.3), 99)
 
+
+class TestCustomTrendZScoreFactor(unittest.TestCase):
+    def setUp(self):
+        from src.factors import CustomTrendZScoreFactor
+        self.factor = CustomTrendZScoreFactor(
+            name="Test_Custom_Factor",
+            lookback_period=40
+        )
+
+    def test_custom_factor_not_ready_initially(self):
+        self.assertFalse(self.factor.is_ready())
+
+    def test_custom_factor_state_transitions(self):
+        # 1. Warm up factor with mock data
+        # spreads: 40 identical spreads except last one
+        for i in range(40):
+            # Z-Score computation standard deviation cannot be zero
+            # So let's vary spreads slightly: 10.0, 11.0, 10.0, 11.0...
+            spread_val = 10.0 + (i % 2)
+            close_val = 100.0 - i
+            
+            payload = AlignedPayload(
+                datetime=f"2026-06-01 10:{i:02d}:00",
+                fcpo_close=close_val,
+                zl_close_usd=60.0,
+                fx_rate=4.5,
+                zl_close_myr=5952.4,
+                spread=spread_val
+            )
+            self.factor.update_data(payload)
+            
+        # close_memory needs at least 60 items
+        for i in range(40, 60):
+            close_val = 100.0 - i
+            payload = AlignedPayload(
+                datetime=f"2026-06-01 10:{i:02d}:00",
+                fcpo_close=close_val,
+                zl_close_usd=60.0,
+                fx_rate=4.5,
+                zl_close_myr=5952.4,
+                spread=10.0 + (i % 2)
+            )
+            self.factor.update_data(payload)
+            
+        self.assertTrue(self.factor.is_ready())
+        
+        # Test Z-Score calculation
+        z = self.factor.compute()
+        
+        # Current close is 100 - 59 = 41
+        # Previous 20 closes are close_list[-21:-1] which is [42, 43, ..., 62]
+        # dynamic_low = min(close_list[-21:-1]) = 42
+        # Since current close = 41 < 42, breakout is triggered!
+        # close is 41, rolling 60 mean is mean(range(41, 101)) = 70.5. 41 < 70.5 is True.
+        # If z_score > 0.5, entry_short should be triggered!
+        
+        # Let's force raw_score and test generate_signal
+        # Initial signal state = 0 (flat)
+        # 1. Test Entry Short: raw_score = 0.6 (>0.5), current close = 41, dynamic_low = 42, mean_60 = 70.5
+        # Since all conditions met, it transitions to -1 (short) and returns -1 (sell open).
+        sig = self.factor.generate_signal(0.6)
+        self.assertEqual(sig, -1)
+        self.assertEqual(self.factor.current_signal, -1)
+        
+        # 2. Test Maintain Short: raw_score = 0.6, no exit triggered (z_score=0.6 >= 0.0, close=41 < mean_30=55.5)
+        # It should return 99 (hold) to prevent multiple short entry signals
+        sig2 = self.factor.generate_signal(0.6)
+        self.assertEqual(sig2, 99)
+        self.assertEqual(self.factor.current_signal, -1)
+        
+        # 3. Test Exit Short (Valuation Repaired): raw_score = -0.1 (< 0.0)
+        # It should transition to 0 (flat) and return 0 (exit close)
+        sig3 = self.factor.generate_signal(-0.1)
+        self.assertEqual(sig3, 0)
+        self.assertEqual(self.factor.current_signal, 0)
+
+
 if __name__ == '__main__':
     unittest.main()

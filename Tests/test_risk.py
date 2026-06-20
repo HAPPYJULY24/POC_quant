@@ -417,5 +417,170 @@ class TestRiskSentinel(unittest.TestCase):
                  
              self.assertTrue(success)  # Ensure no exception propagates to crash the main thread
 
+    def test_timezone_aware_rollover_period(self):
+        """Verify that is_rollover_period correctly parses and handles timezone boundary conditions."""
+        self.sentinel.rollover_settings = {
+            "FCPO": {
+                "rollover_dates": ["2026-06-15"],
+                "buffer_days_before": 2,
+                "buffer_days_after": 1,
+                "policy": "reject",
+                "reduce_ratio": 0.5
+            }
+        }
+        self.sentinel.config.sessions = {"timezone": "Asia/Kuala_Lumpur"}
+        
+        # 1. 2026-06-15 is rollover date -> True
+        in_roll, roll_date, roll_cfg = self.sentinel.is_rollover_period("FCPO", "2026-06-15 10:30:00")
+        self.assertTrue(in_roll)
+        self.assertEqual(roll_date, "2026-06-15")
+        
+        # 2. 2 days before: 2026-06-13 -> True
+        in_roll, _, _ = self.sentinel.is_rollover_period("FCPO", "2026-06-13 23:59:59")
+        self.assertTrue(in_roll)
+        
+        # 3. 3 days before: 2026-06-12 -> False
+        in_roll, _, _ = self.sentinel.is_rollover_period("FCPO", "2026-06-12 23:59:59")
+        self.assertFalse(in_roll)
+        
+        # 4. 1 day after: 2026-06-16 -> True
+        in_roll, _, _ = self.sentinel.is_rollover_period("FCPO", "2026-06-16 00:00:00")
+        self.assertTrue(in_roll)
+        
+        # 5. 2 days after: 2026-06-17 -> False
+        in_roll, _, _ = self.sentinel.is_rollover_period("FCPO", "2026-06-17 00:00:00")
+        self.assertFalse(in_roll)
+
+    def test_rollover_small_capital_trap_to_reject(self):
+        """Verify that when final_lots * reduce_ratio == 0, the reduce mode falls back to reject and returns None."""
+        self.sentinel.rollover_settings = {
+            "FCPO": {
+                "rollover_dates": ["2026-06-15"],
+                "buffer_days_before": 2,
+                "buffer_days_after": 1,
+                "policy": "reduce",
+                "reduce_ratio": 0.5
+            }
+        }
+        self.sentinel.config.sessions = {"timezone": "Asia/Kuala_Lumpur"}
+        
+        signal = SignalPayload(
+            timestamp="2026-06-15 10:30:00",
+            factor_name="ZScore_FCPO_ZL",
+            raw_score=2.5,
+            action_signal=-1,
+            current_price=4500.0,
+            volatility_metric=20.0,
+            symbol="FCPO"
+        )
+        
+        state = {
+            "current_capital": 100000.0,
+            "position_direction": 0,
+            "position_lots": 0,
+            "average_entry_price": None,
+            "last_updated": "2026-06-15 10:00:00"
+        }
+        
+        with patch('src.database.load_portfolio_state', return_value=state):
+            instruction = self.sentinel.process_signal(signal)
+            self.assertIsNone(instruction)
+
+    def test_dynamic_emergency_rollover_close(self):
+        """Verify that SignalPayload with is_emergency_rollover=True immediately triggers forced close when holding position."""
+        signal = SignalPayload(
+            timestamp="2026-06-18 10:30:00",
+            factor_name="EMERGENCY_ROLLOVER_DETECTOR",
+            raw_score=0.0,
+            action_signal=99,
+            current_price=4500.0,
+            volatility_metric=1.0,
+            symbol="FCPO",
+            is_emergency_rollover=True
+        )
+        
+        self.sentinel.rollover_settings = {
+            "FCPO": {
+                "rollover_dates": ["2026-06-15"],
+                "buffer_days_before": 2,
+                "buffer_days_after": 1,
+                "policy": "reject",
+                "reduce_ratio": 0.5
+            }
+        }
+        self.sentinel.config.sessions = {"timezone": "Asia/Kuala_Lumpur"}
+        
+        state = {
+            "current_capital": 100000.0,
+            "position_direction": 1,
+            "position_lots": 2,
+            "average_entry_price": 4400.0,
+            "last_updated": "2026-06-18 10:00:00"
+        }
+        
+        with patch('src.database.load_portfolio_state', return_value=state):
+            instruction = self.sentinel.process_signal(signal)
+            self.assertIsNotNone(instruction)
+            self.assertEqual(instruction["action_type"], "CLOSE")
+            self.assertEqual(instruction["target_direction"], 0)
+            self.assertEqual(instruction["suggested_lots"], 2)
+            
+        state["position_direction"] = 0
+        state["position_lots"] = 0
+        with patch('src.database.load_portfolio_state', return_value=state):
+            instruction = self.sentinel.process_signal(signal)
+            self.assertIsNone(instruction)
+
+    def test_rollover_reject_and_reduce_policies(self):
+        """Verify reject and reduce policies during rollover periods when no emergency is active."""
+        self.sentinel.rollover_settings = {
+            "FCPO": {
+                "rollover_dates": ["2026-06-15"],
+                "buffer_days_before": 2,
+                "buffer_days_after": 1,
+                "policy": "reject",
+                "reduce_ratio": 0.5
+            }
+        }
+        self.sentinel.config.sessions = {"timezone": "Asia/Kuala_Lumpur"}
+        
+        signal = SignalPayload(
+            timestamp="2026-06-15 10:30:00",
+            factor_name="ZScore_FCPO_ZL",
+            raw_score=2.5,
+            action_signal=1,
+            current_price=4500.0,
+            volatility_metric=20.0,
+            symbol="FCPO"
+        )
+        
+        state = {
+            "current_capital": 100000.0,
+            "position_direction": 1,
+            "position_lots": 2,
+            "average_entry_price": 4400.0,
+            "last_updated": "2026-06-15 10:00:00"
+        }
+        
+        with patch('src.database.load_portfolio_state', return_value=state):
+            instruction = self.sentinel.process_signal(signal)
+            self.assertIsNotNone(instruction)
+            self.assertEqual(instruction["action_type"], "CLOSE")
+            self.assertEqual(instruction["target_direction"], 0)
+            
+        state["position_direction"] = 0
+        state["position_lots"] = 0
+        with patch('src.database.load_portfolio_state', return_value=state):
+            instruction = self.sentinel.process_signal(signal)
+            self.assertIsNone(instruction)
+            
+        self.sentinel.rollover_settings["FCPO"]["policy"] = "reduce"
+        signal.volatility_metric = 5.0
+        with patch('src.database.load_portfolio_state', return_value=state):
+            instruction = self.sentinel.process_signal(signal)
+            self.assertIsNotNone(instruction)
+            self.assertEqual(instruction["action_type"], "OPEN")
+            self.assertEqual(instruction["suggested_lots"], 2)
+
 if __name__ == '__main__':
     unittest.main()

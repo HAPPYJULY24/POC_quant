@@ -1,6 +1,8 @@
 import math
 import sqlite3
 from typing import Dict, Any, Optional, Tuple
+from datetime import datetime, timedelta
+import pytz
 
 from src.models import SignalPayload
 from src.config import ConfigManager
@@ -24,12 +26,49 @@ class RiskSentinel:
         self.multiplier = self.fcpo_cfg.get("multiplier", 25.0)
         self.tick_size = self.fcpo_cfg.get("tick_size", 1.0)
         self.margin_per_lot = 8000.0  # Safe default margin requirement per lot (RM)
+        self.rollover_settings = self.config.strategy.get("rollover_settings", {})
 
     def clean_price(self, raw_price: float, tick: float) -> float:
         """Round the price strictly to the exchange's minimum tick-size boundary."""
         if raw_price is None or math.isnan(raw_price):
             return 0.0
         return round(raw_price / tick) * tick
+
+    def is_rollover_period(self, symbol: str, timestamp_str: str) -> Tuple[bool, Optional[str], Optional[dict]]:
+        """Check if the current signal time falls within the configured rollover risk window (timezone-aware)."""
+        roll_cfg = self.rollover_settings.get(symbol)
+        if not roll_cfg:
+            return False, None, None
+            
+        try:
+            # 1. Parse timezone from configuration
+            tz_name = self.config.sessions.get("timezone", "Asia/Kuala_Lumpur")
+            local_tz = pytz.timezone(tz_name)
+            
+            # 2. Parse timestamp string to naive datetime and localize it to Asia/Kuala_Lumpur
+            naive_dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+            localized_dt = local_tz.localize(naive_dt)
+            signal_date = localized_dt.date()
+        except Exception as e:
+            logger.error(f"Failed to parse signal timestamp {timestamp_str}: {e}")
+            return False, None, None
+            
+        roll_dates = roll_cfg.get("rollover_dates", [])
+        days_before = roll_cfg.get("buffer_days_before", 2)
+        days_after = roll_cfg.get("buffer_days_after", 1)
+        
+        for r_date_str in roll_dates:
+            try:
+                # 3. Parse rollover date (assumed to be in local timezone)
+                r_date = datetime.strptime(r_date_str, "%Y-%m-%d").date()
+                start_date = r_date - timedelta(days=days_before)
+                end_date = r_date + timedelta(days=days_after)
+                if start_date <= signal_date <= end_date:
+                    return True, r_date_str, roll_cfg
+            except Exception as e:
+                logger.error(f"Failed to parse rollover date {r_date_str}: {e}")
+                
+        return False, None, None
 
     def process_signal(self, signal: SignalPayload) -> Optional[Dict[str, Any]]:
         """Orchestrate the 5 layers of Risk Sentinel logic. Returns trade instructions or None."""
@@ -55,23 +94,65 @@ class RiskSentinel:
         pos_direction = state["position_direction"]  # -1, 0, 1
         pos_lots = state["position_lots"]
         
+        # Rollover Risk State Machine Interception
+        in_rollover, roll_date, roll_cfg = self.is_rollover_period(symbol, signal.timestamp)
+        is_forced_close = False
+        is_emergency = getattr(signal, "is_emergency_rollover", False)
+        
+        # Local copy to prevent mutating incoming payload object references
+        action_signal = signal.action_signal
+        
+        if is_emergency:
+            logger.warning("🚨 [EMERGENCY ROLLOVER DETECTED] Dynamic price jump triggered callback.")
+            if pos_direction != 0:
+                logger.warning("FORCED LIQUIDATION: Override signal to force-close active position immediately.")
+                action_signal = 0
+                is_forced_close = True
+            else:
+                logger.info("Emergency rollover signal received but position is already flat. Ignoring.")
+                return None
+        elif in_rollover:
+            policy = roll_cfg.get("policy", "reject")
+            logger.warning(
+                f"🚨 [ROLLOVER RISK WINDOW ACTIVE] Signal time {signal.timestamp} is within "
+                f"rollover period (Date: {roll_date}, Policy: {policy})."
+            )
+            
+            if policy == "reject":
+                if pos_direction != 0:
+                    if action_signal != 0:
+                        logger.warning("FORCED LIQUIDATION: Override signal to force-close active position.")
+                        action_signal = 0
+                        is_forced_close = True
+                else:
+                    if action_signal in [1, -1]:
+                        print("\n" + "=" * 70)
+                        print("⚠️⚠️⚠️ 【风控拦截：处于换月风险期 - 开仓指令已拒绝】 ⚠️⚠️⚠️")
+                        print("=" * 70)
+                        print(f"  [时间]   : {signal.timestamp}")
+                        print(f"  [标的]   : {asset_display}")
+                        print(f"  [换月日] : {roll_date}")
+                        print(f"  [说明]   : 处于换月日前后窗口，禁止建立新仓位以规避滑点及流动性风险！")
+                        print("=" * 70 + "\n")
+                        return None
+                        
         # Intercept 99 (Hold/Maintain state) - no signal action required
-        if signal.action_signal == 99:
+        if action_signal == 99:
             logger.info("Signal is 99 (Hold). Maintaining current position state. Wind control green light.")
             return None
             
         # Anti-Fool: If signal tries to buy more when already long and full
-        if signal.action_signal == 1 and pos_direction == 1 and pos_lots >= self.max_position_lots:
+        if action_signal == 1 and pos_direction == 1 and pos_lots >= self.max_position_lots:
             logger.warning("Anti-Fool Intercept: Already holding maximum long position. Signal blocked.")
             return None
         # Anti-Fool: If signal tries to sell more when already short and full
-        if signal.action_signal == -1 and pos_direction == -1 and pos_lots >= self.max_position_lots:
+        if action_signal == -1 and pos_direction == -1 and pos_lots >= self.max_position_lots:
             logger.warning("Anti-Fool Intercept: Already holding maximum short position. Signal blocked.")
             return None
 
         # Determine if this is a Closing action, Opening action, or Inverse Closing action
         action_type = "STANDBY"
-        target_direction = signal.action_signal  # -1, 0, 1
+        target_direction = action_signal  # -1, 0, 1
         
         if target_direction == 0:
             if pos_direction == 0:
@@ -114,6 +195,26 @@ class RiskSentinel:
             # Hard limit truncation
             final_lots = min(target_lots, self.max_position_lots)
             
+            # Apply rollover reduction if active and policy is reduce
+            if in_rollover and not is_emergency and roll_cfg.get("policy") == "reduce":
+                reduce_ratio = roll_cfg.get("reduce_ratio", 0.5)
+                old_lots = final_lots
+                reduced_lots = math.floor(final_lots * reduce_ratio)
+                if reduced_lots == 0:
+                    # Small capital trap fallback to reject
+                    print("\n" + "=" * 70)
+                    print("⚠️⚠️⚠️ 【风控拦截：降仓不足开仓 - 指令已拦截】 ⚠️⚠️⚠️")
+                    print("=" * 70)
+                    print(f"  [时间]   : {signal.timestamp}")
+                    print(f"  [标的]   : {asset_display}")
+                    print(f"  [换月日] : {roll_date}")
+                    print(f"  [说明]   : 降仓后手数为 0 (原 {old_lots} 手 * {reduce_ratio})，资金规模不足以在换月期安全建仓，拒绝该笔交易。")
+                    print("=" * 70 + "\n")
+                    return None
+                else:
+                    final_lots = reduced_lots
+                    logger.info(f"Rollover Risk Sizing: Position reduced from {old_lots} to {final_lots} lots due to reduce policy.")
+            
             # Margin Check:
             required_margin = final_lots * margin_per_lot
             if required_margin > current_capital:
@@ -148,6 +249,12 @@ class RiskSentinel:
                 action_name = "SELL EXIT (平多出局)"
             elif pos_direction == -1:
                 action_name = "BUY EXIT (平空出局)"
+                
+            if is_forced_close:
+                if is_emergency:
+                    action_name = "EMERGENCY ROLLOVER LIQUIDATION (紧急换月强制平仓)"
+                else:
+                    action_name = "FORCED ROLLOVER LIQUIDATION (换月强制清仓)"
                 
         if action_type == "REVERSE_SWITCH":
             stop_loss = self.clean_price(entry_price - stop_loss_distance if target_direction == 1 else entry_price + stop_loss_distance, tick_size)
